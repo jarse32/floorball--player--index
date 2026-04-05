@@ -20,9 +20,35 @@ OUTPUT_PATH = os.path.join(os.path.dirname(__file__), "..", "docs", "player-inde
 # All 10 German floorball operation IDs (7 doesn't exist)
 ALL_OPERATION_IDS = {1, 2, 3, 4, 5, 6, 8, 9, 10, 11}
 
+# Season number → year label (start_year = 2008 + season)
+# Verified via game dates: Season 17 starts 2025-09, Season 10 starts 2018-09
+SEASON_YEARS = {str(s): f"{2008+s}/{str(2009+s)[-2:]}" for s in range(1, 30)}
+
 # Rate limiting: max concurrent requests
 MAX_CONCURRENT = 20
 REQUEST_DELAY = 0.05  # 50ms between batches
+
+# Penalty minutes calculation: MS (Matchstrafe) = 25 min
+PENALTY_MINUTES = {
+    "penalty_2": 2,
+    "penalty_2and2": 4,
+    "penalty_5": 5,
+    "penalty_10": 10,
+    "penalty_ms_tech": 25,
+    "penalty_ms_full": 25,
+    "penalty_ms1": 25,
+    "penalty_ms2": 25,
+    "penalty_ms3": 25,
+}
+
+
+def calc_penalty_minutes(scorer: dict) -> int:
+    """Calculate total penalty minutes from all penalty fields."""
+    total = 0
+    for field, minutes in PENALTY_MINUTES.items():
+        count = scorer.get(field) or 0
+        total += count * minutes
+    return total
 
 
 async def fetch_json(session: aiohttp.ClientSession, url: str, semaphore: asyncio.Semaphore):
@@ -77,10 +103,13 @@ async def build_index():
 
         # Build league info lookup
         league_info = {}
+        found_seasons = set()
         for l in leagues:
+            season = l.get("season", "")
+            found_seasons.add(season)
             league_info[l["id"]] = {
                 "name": l.get("name", ""),
-                "season_id": l.get("season", ""),
+                "season": season,
                 "operation_name": l.get("game_operation_name") or l.get("game_operation") or "",
             }
 
@@ -114,7 +143,7 @@ async def build_index():
 
         for league_id, scorers in all_scorers.items():
             info = league_info.get(league_id, {})
-            season = info.get("season_id", "")
+            season = info.get("season", "")
             league_name = info.get("name", "")
             operation_name = info.get("operation_name", "")
 
@@ -128,6 +157,8 @@ async def build_index():
                 ln = scorer.get("last_name") or ""
                 goals = scorer.get("goals") or 0
                 assists = scorer.get("assists") or 0
+                games = scorer.get("games") or 0
+                pm = calc_penalty_minutes(scorer)
                 team_name = scorer.get("team_name") or ""
                 team_id = scorer.get("team_id") or 0
 
@@ -153,6 +184,8 @@ async def build_index():
                     "tn": team_name,
                     "g": goals,
                     "a": assists,
+                    "gp": games,
+                    "pm": pm,
                 })
 
         # Step 4: Sort entries per player (newest season first, then by points desc)
@@ -161,12 +194,16 @@ async def build_index():
                 key=lambda e: (-int(e["s"]) if e["s"].isdigit() else 0, -(e["g"] + e["a"]))
             )
 
-        # Step 5: Write output
+        # Step 5: Build season year mapping (only for seasons found in data)
+        season_years = {s: SEASON_YEARS[s] for s in sorted(found_seasons) if s in SEASON_YEARS}
+
+        # Step 6: Write output
         output = {
-            "version": 1,
+            "version": 2,
             "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "player_count": len(players),
             "league_count": len(all_scorers),
+            "seasons": season_years,
             "players": players,
         }
 
@@ -180,6 +217,7 @@ async def build_index():
         print(f"\nDone!")
         print(f"  Players: {len(players):,}")
         print(f"  Leagues processed: {len(all_scorers):,}")
+        print(f"  Seasons: {season_years}")
         print(f"  Output: {OUTPUT_PATH}")
         print(f"  File size: {file_size / 1024 / 1024:.1f} MB")
         print(f"  Elapsed: {elapsed:.1f}s")
