@@ -80,7 +80,7 @@ async def build_index():
         for l in leagues:
             league_info[l["id"]] = {
                 "name": l.get("name", ""),
-                "season_id": l.get("season_id", ""),
+                "season_id": l.get("season", ""),
                 "operation_name": l.get("game_operation_name") or l.get("game_operation") or "",
             }
 
