@@ -20,9 +20,8 @@ OUTPUT_PATH = os.path.join(os.path.dirname(__file__), "..", "docs", "player-inde
 # All 10 German floorball operation IDs (7 doesn't exist)
 ALL_OPERATION_IDS = {1, 2, 3, 4, 5, 6, 8, 9, 10, 11}
 
-# Season number → year label (start_year = 2008 + season)
-# Verified via game dates: Season 17 starts 2025-09, Season 10 starts 2018-09
-SEASON_YEARS = {str(s): f"{2008+s}/{str(2009+s)[-2:]}" for s in range(1, 30)}
+# Season years loaded from API at runtime
+SEASON_YEARS = {}  # populated by fetch_season_years()
 
 # Rate limiting: max concurrent requests
 MAX_CONCURRENT = 20
@@ -71,6 +70,18 @@ async def fetch_json(session: aiohttp.ClientSession, url: str, semaphore: asynci
         return None
 
 
+async def fetch_season_years(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore):
+    """Fetch season ID → year label mapping from init.json."""
+    global SEASON_YEARS
+    print("Fetching season years from init.json...")
+    data = await fetch_json(session, f"{API_BASE}/init.json", semaphore)
+    if data and "seasons" in data:
+        SEASON_YEARS = {str(s["id"]): s["name"] for s in data["seasons"]}
+        print(f"  Found {len(SEASON_YEARS)} seasons: {', '.join(f'{k}={v}' for k, v in sorted(SEASON_YEARS.items(), key=lambda x: int(x[0])))}")
+    else:
+        print("  WARNING: Could not fetch season years, using empty mapping")
+
+
 async def fetch_all_leagues(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore):
     """Fetch the complete leagues list."""
     print("Fetching all leagues...")
@@ -98,6 +109,9 @@ async def build_index():
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
     async with aiohttp.ClientSession() as session:
+        # Step 0: Fetch season year mapping
+        await fetch_season_years(session, semaphore)
+
         # Step 1: Get all leagues
         leagues = await fetch_all_leagues(session, semaphore)
 
