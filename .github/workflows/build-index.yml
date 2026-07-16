@@ -22,6 +22,8 @@ jobs:
         run: pip install aiohttp
 
       - name: Build player index
+        env:
+          SAISONMANAGER_API_KEY: ${{ secrets.SAISONMANAGER_API_KEY }}
         run: python scripts/build_index.py
 
       - name: Commit and push if changed

@@ -17,6 +17,9 @@ from datetime import datetime, timezone
 API_BASE = "https://saisonmanager.de/api/v2"
 OUTPUT_PATH = os.path.join(os.path.dirname(__file__), "..", "docs", "player-index.json")
 
+# API-Key ausschliesslich aus der Umgebung (GitHub Secret) — niemals im Code
+API_KEY = os.environ.get("SAISONMANAGER_API_KEY", "")
+
 # All 10 German floorball operation IDs (7 doesn't exist)
 ALL_OPERATION_IDS = {1, 2, 3, 4, 5, 6, 8, 9, 10, 11}
 
@@ -60,6 +63,12 @@ async def fetch_json(session: aiohttp.ClientSession, url: str, semaphore: asynci
                         return await resp.json()
                     elif resp.status == 404:
                         return None
+                    elif resp.status == 401:
+                        # Key fehlt oder ist ungueltig — sofort abbrechen statt
+                        # 3x pro Liga (x1.943 Ligen) sinnlos zu retrien und am
+                        # Ende eine unvollstaendige player-index.json zu bauen
+                        print("ERROR: HTTP 401 Unauthorized — SAISONMANAGER_API_KEY ungueltig oder von der API abgelehnt")
+                        sys.exit(1)
                     else:
                         print(f"  HTTP {resp.status} for {url}, retry {attempt+1}")
                         await asyncio.sleep(1 * (attempt + 1))
@@ -108,7 +117,16 @@ async def build_index():
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-    async with aiohttp.ClientSession() as session:
+    # Fail-Fast: ohne Key laeuft der naechtliche Build sonst 1.943 Ligen lang
+    # ins Leere, bevor der Fehler ueberhaupt sichtbar wird
+    if not API_KEY:
+        print("ERROR: SAISONMANAGER_API_KEY nicht gesetzt")
+        sys.exit(1)
+
+    # Key als Header an die zentrale Session haengen — gilt automatisch fuer
+    # alle Requests, die ueber diese Session laufen (fetch_json et al.)
+    headers = {"X-Api-Key": API_KEY}
+    async with aiohttp.ClientSession(headers=headers) as session:
         # Step 0: Fetch season year mapping
         await fetch_season_years(session, semaphore)
 
