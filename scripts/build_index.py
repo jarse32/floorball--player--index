@@ -26,9 +26,26 @@ ALL_OPERATION_IDS = {1, 2, 3, 4, 5, 6, 8, 9, 10, 11}
 # Season years loaded from API at runtime
 SEASON_YEARS = {}  # populated by fetch_season_years()
 
-# Rate limiting: max concurrent requests
-MAX_CONCURRENT = 20
-REQUEST_DELAY = 0.05  # 50ms between batches
+# Rate limiting: Saisonmanager erlaubt laut offizieller API-Doku 60
+# Anfragen/Minute pro Key (Header 'Retry-After' bei Ueberschreitung).
+# MAX_CONCURRENT=1 + REQUEST_DELAY=1.1s heisst effektiv sequenzielle
+# Anfragen, gut eine Sekunde auseinander - knapp unter dem Limit, mit
+# kleinem Sicherheitsabstand gegen Timing-Jitter.
+#
+# Vorher: MAX_CONCURRENT=20 + REQUEST_DELAY=0.05s (~400 Requests/s
+# Spitzenlast, ~400x ueber dem dokumentierten Limit) - das war die Ursache
+# der 429-Kaskade, die ganze Ligen unbemerkt aus dem Index warf (siehe
+# fetch_json: 429 wurde bisher wie ein normaler Fehler behandelt, Retry-
+# After ignoriert, nach 3 Versuchen still None zurueckgegeben).
+#
+# Macht den Build spuerbar laenger (~2460 Ligen x 1.1s =~ 45 Minuten reine
+# Scorer-Fetches statt vorher ~2 Minuten), dafuer vollstaendig statt
+# loechrig - "lieber langsam und vollstaendig als schnell und loechrig".
+# OFFEN: ob fuer diesen Key ein hoeheres Limit gilt (die Doku erwaehnt
+# "Brauchst du dauerhaft mehr, melde dich"), ist NICHT verifiziert -
+# bewusst konservativ am dokumentierten Wert geplant statt geraten.
+MAX_CONCURRENT = 1
+REQUEST_DELAY = 1.1
 
 # Penalty minutes calculation: MS (Matchstrafe) = 25 min
 PENALTY_MINUTES = {
@@ -54,37 +71,90 @@ def calc_penalty_minutes(scorer: dict) -> int:
 
 
 async def fetch_json(session: aiohttp.ClientSession, url: str, semaphore: asyncio.Semaphore):
-    """Fetch JSON from URL with rate limiting."""
+    """Fetch JSON from URL, mit Ratelimit-Handling.
+
+    Gibt ein (ok, data)-Tupel zurueck statt nur der Daten - der Aufrufer muss
+    einen ECHTEN Fehlschlag (ok=False) von einer legitimen leeren/fehlenden
+    Antwort (ok=True, data=None oder []) unterscheiden koennen. Vorher gab
+    es nur einen Rueckgabewert und die Aufrufer prueften `if result:` - das
+    wirft einen echten Fehlschlag (None) und eine echte leere Scorerliste
+    ([], z.B. deaktiviert in U13-Ligen) in denselben Topf, weil beide in
+    Python falsy sind. Folge: eine Liga mit legitim leerer Scorerliste sah
+    wie ein Fehlschlag aus - und ein echter Fehlschlag verschwand lautlos,
+    ohne dass die aufrufende Stelle das ueberhaupt bemerken konnte.
+    """
+    # Echte Fehler (Timeout, 5xx, Netzwerkfehler): kurze Grenze - eine
+    # dauerhaft kaputte Liga soll den Build nicht ewig aufhalten.
+    MAX_ERROR_ATTEMPTS = 3
+    # HTTP 429 (Ratelimit) zaehlt bewusst NICHT gegen MAX_ERROR_ATTEMPTS und
+    # bekommt ein deutlich hoeheres eigenes Limit: ein Ratelimit ist kein
+    # Fehler der Liga oder des Servers, sondern bei ~2460 Ligen und einem
+    # 60-Anfragen/Minute-Limit ein erwartbarer, temporaerer Zustand. Ohne
+    # diese Trennung haette ein 429 denselben Effekt wie ein echter Fehler
+    # (Liga faellt aus dem Index) - das war der urspruengliche Bug.
+    MAX_RATE_LIMIT_ATTEMPTS = 10
+
+    error_attempt = 0
+    rate_limit_attempt = 0
+
     async with semaphore:
-        for attempt in range(3):
+        while True:
             try:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                     if resp.status == 200:
-                        return await resp.json()
-                    elif resp.status == 404:
-                        return None
-                    elif resp.status == 401:
+                        return True, await resp.json()
+
+                    if resp.status == 404:
+                        return True, None
+
+                    if resp.status == 401:
                         # Key fehlt oder ist ungueltig — sofort abbrechen statt
-                        # 3x pro Liga (x1.943 Ligen) sinnlos zu retrien und am
-                        # Ende eine unvollstaendige player-index.json zu bauen
+                        # sinnlos ueber alle Ligen zu retrien und am Ende eine
+                        # unvollstaendige player-index.json zu bauen.
                         print("ERROR: HTTP 401 Unauthorized — SAISONMANAGER_API_KEY ungueltig oder von der API abgelehnt")
                         sys.exit(1)
-                    else:
-                        print(f"  HTTP {resp.status} for {url}, retry {attempt+1}")
-                        await asyncio.sleep(1 * (attempt + 1))
+
+                    if resp.status == 429:
+                        rate_limit_attempt += 1
+                        if rate_limit_attempt > MAX_RATE_LIMIT_ATTEMPTS:
+                            print(f"  FAILED (Ratelimit haelt an nach {MAX_RATE_LIMIT_ATTEMPTS} Wartezyklen): {url}")
+                            return False, None
+                        # Retry-After ist die verbindliche Vorgabe des Servers
+                        # (Sekunden) - nur wenn er fehlt, exponentielles
+                        # Backoff als Fallback, gedeckelt auf 60s gegen einen
+                        # ausufernden Einzel-Wartezyklus.
+                        retry_after = resp.headers.get("Retry-After")
+                        try:
+                            wait = float(retry_after) if retry_after is not None else min(2 ** rate_limit_attempt, 60)
+                        except ValueError:
+                            wait = min(2 ** rate_limit_attempt, 60)
+                        print(f"  HTTP 429 (Ratelimit) fuer {url} - warte {wait:.1f}s (Wartezyklus {rate_limit_attempt}/{MAX_RATE_LIMIT_ATTEMPTS})")
+                        await asyncio.sleep(wait)
+                        continue
+
+                    # Alle anderen Status (5xx etc.): echter Fehler.
+                    error_attempt += 1
+                    print(f"  HTTP {resp.status} for {url}, retry {error_attempt}/{MAX_ERROR_ATTEMPTS}")
+                    if error_attempt >= MAX_ERROR_ATTEMPTS:
+                        print(f"  FAILED after {MAX_ERROR_ATTEMPTS} retries: {url}")
+                        return False, None
+                    await asyncio.sleep(1 * error_attempt)
+
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                print(f"  Error fetching {url}: {e}, retry {attempt+1}")
-                await asyncio.sleep(1 * (attempt + 1))
-        print(f"  FAILED after 3 retries: {url}")
-        return None
+                error_attempt += 1
+                print(f"  Error fetching {url}: {e}, retry {error_attempt}/{MAX_ERROR_ATTEMPTS}")
+                if error_attempt >= MAX_ERROR_ATTEMPTS:
+                    print(f"  FAILED after {MAX_ERROR_ATTEMPTS} retries: {url}")
+                    return False, None
+                await asyncio.sleep(1 * error_attempt)
 
 
 async def fetch_season_years(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore):
     """Fetch season ID → year label mapping from init.json."""
     global SEASON_YEARS
     print("Fetching season years from init.json...")
-    data = await fetch_json(session, f"{API_BASE}/init.json", semaphore)
-    if data and "seasons" in data:
+    ok, data = await fetch_json(session, f"{API_BASE}/init.json", semaphore)
+    if ok and data and "seasons" in data:
         SEASON_YEARS = {str(s["id"]): s["name"] for s in data["seasons"]}
         print(f"  Found {len(SEASON_YEARS)} seasons: {', '.join(f'{k}={v}' for k, v in sorted(SEASON_YEARS.items(), key=lambda x: int(x[0])))}")
     else:
@@ -94,8 +164,8 @@ async def fetch_season_years(session: aiohttp.ClientSession, semaphore: asyncio.
 async def fetch_all_leagues(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore):
     """Fetch the complete leagues list."""
     print("Fetching all leagues...")
-    data = await fetch_json(session, f"{API_BASE}/leagues.json", semaphore)
-    if not data:
+    ok, data = await fetch_json(session, f"{API_BASE}/leagues.json", semaphore)
+    if not ok or not data:
         print("ERROR: Could not fetch leagues.json")
         sys.exit(1)
 
@@ -106,7 +176,7 @@ async def fetch_all_leagues(session: aiohttp.ClientSession, semaphore: asyncio.S
 
 
 async def fetch_scorer_list(session: aiohttp.ClientSession, league_id: int, semaphore: asyncio.Semaphore):
-    """Fetch scorer list for a single league."""
+    """Fetch scorer list for a single league. Gibt (ok, liste) zurueck, siehe fetch_json."""
     url = f"{API_BASE}/leagues/{league_id}/scorer.json"
     return await fetch_json(session, url, semaphore)
 
@@ -153,21 +223,43 @@ async def build_index():
         # Process in batches
         batch_size = MAX_CONCURRENT
         all_scorers = {}  # league_id -> scorer list
+        failed_league_ids = []  # Ligen mit ECHTEM Fehlschlag nach allen Retries
 
         for i in range(0, total, batch_size):
             batch = league_ids[i:i + batch_size]
             tasks = [fetch_scorer_list(session, lid, semaphore) for lid in batch]
             results = await asyncio.gather(*tasks)
 
-            for lid, result in zip(batch, results):
-                if result:
-                    all_scorers[lid] = result
+            for lid, (ok, result) in zip(batch, results):
+                if ok:
+                    # result ist entweder eine (evtl. leere) Liste oder None
+                    # bei HTTP 404 - beides ein legitimes Ergebnis, keine
+                    # Liga faellt deswegen faelschlich aus dem Index (siehe
+                    # fetch_json-Dokumentation).
+                    all_scorers[lid] = result if result is not None else []
+                else:
+                    failed_league_ids.append(lid)
 
             done = min(i + batch_size, total)
-            print(f"  Progress: {done}/{total} ({done*100//total}%)")
+            print(f"  Progress: {done}/{total} ({done*100//total}%, {len(failed_league_ids)} echte Fehlschlaege bisher)")
             await asyncio.sleep(REQUEST_DELAY)
 
-        print(f"\n  Successfully fetched {len(all_scorers)} scorer lists out of {total}")
+        print(f"\n  Erfolgreich: {len(all_scorers)}/{total} Ligen ({len(failed_league_ids)} echte Fehlschlaege nach allen Retries)")
+
+        # Fail-loud statt fail-silent: der bisherige Code baute bei
+        # Fehlschlaegen einfach einen loechrigen Index und veroeffentlichte
+        # ihn kommentarlos. Ein echter Fehlschlag nach MAX_ERROR_ATTEMPTS
+        # Versuchen UND MAX_RATE_LIMIT_ATTEMPTS Ratelimit-Wartezyklen ist bei
+        # korrekt gedrosseltem Durchsatz (siehe MAX_CONCURRENT/REQUEST_DELAY
+        # oben) die Ausnahme, nicht die Regel - deshalb harter Abbruch statt
+        # einer Toleranzschwelle: der GitHub-Actions-Lauf wird rot, git push
+        # unterbleibt, die zuletzt veroeffentlichte, vollstaendige
+        # player-index.json bleibt online. Analog zum Fail-Fast-Prinzip im
+        # History-Builder (build.php) im iOS-Repo.
+        if failed_league_ids:
+            print(f"\n  FEHLGESCHLAGENE LIGEN ({len(failed_league_ids)}): {failed_league_ids}")
+            print("  Breche ab, OHNE player-index.json zu schreiben - der bisherige, vollstaendige Stand bleibt online.")
+            sys.exit(1)
 
         # Step 3: Aggregate by player_id
         print("\nAggregating player data...")
@@ -239,9 +331,15 @@ async def build_index():
             "players": players,
         }
 
+        # Atomar schreiben (Temp-Datei + os.replace): ein Absturz/Kill mitten
+        # im Schreiben (z.B. durch ein CI-Timeout) darf die zuletzt gueltige
+        # player-index.json nicht durch einen halb geschriebenen Stand
+        # ersetzen. os.replace ist auf demselben Dateisystem atomar.
         os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-        with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+        tmp_path = OUTPUT_PATH + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(output, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp_path, OUTPUT_PATH)
 
         elapsed = time.time() - start_time
         file_size = os.path.getsize(OUTPUT_PATH)
