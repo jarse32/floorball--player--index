@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import time
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 API_BASE = "https://saisonmanager.de/api/v2"
@@ -68,6 +69,44 @@ def calc_penalty_minutes(scorer: dict) -> int:
         count = scorer.get(field) or 0
         total += count * minutes
     return total
+
+
+def resolve_display_name(candidates):
+    """Waehlt (Vorname, Nachname) aus den gesammelten Scorer-Namenskandidaten.
+
+    Regel: Der Name aus der NEUESTEN Saison gewinnt, in der der Spieler in
+    einer Scorerliste auftaucht. Das korrigiert Erfassungsfehler in alten
+    Ligen (frueher gewann der erste Treffer und wurde nie mehr korrigiert)
+    und uebernimmt zugleich echte Namensaenderungen. Eine Mehrheitsregel
+    waere hier falsch: bei einer echten Aenderung sind die alten Saisons
+    meist in der Ueberzahl und wuerden den alten Namen zementieren.
+
+    Tie-Break bei mehreren Ligen derselben Saison: haeufigstes
+    (Vorname, Nachname)-Paar; bleibt es gleich, stabil die hoechste
+    league_id. Vor- und Nachname werden immer als Paar uebernommen, nie
+    einzeln gemischt.
+
+    `candidates`: Liste von (season_int, league_id, first_name, last_name);
+    nur Zeilen mit mindestens einem nicht-leeren Namensfeld. Leere Liste
+    ergibt ("", "") — wie im bisherigen Verhalten.
+    """
+    if not candidates:
+        return "", ""
+
+    newest_season = max(season for season, _, _, _ in candidates)
+    in_newest = [c for c in candidates if c[0] == newest_season]
+
+    pair_counts = Counter((fn, ln) for _, _, fn, ln in in_newest)
+    max_lid_for_pair = {}
+    for _, lid, fn, ln in in_newest:
+        key = (fn, ln)
+        if lid > max_lid_for_pair.get(key, -1):
+            max_lid_for_pair[key] = lid
+
+    return max(
+        pair_counts,
+        key=lambda pair: (pair_counts[pair], max_lid_for_pair[pair]),
+    )
 
 
 async def fetch_json(session: aiohttp.ClientSession, url: str, semaphore: asyncio.Semaphore):
@@ -264,6 +303,11 @@ async def build_index():
         # Step 3: Aggregate by player_id
         print("\nAggregating player data...")
         players = {}  # player_id -> { fn, ln, entries: [...] }
+        # Namenskandidaten pro Spieler: (season_int, league_id, fn, ln).
+        # Der Anzeigename wird NICHT mehr beim ersten Treffer festgelegt,
+        # sondern erst nach dem Sammeln aufgeloest (Step 3b) - sonst
+        # zementiert ein Erfassungsfehler in einer alten Liga den Namen.
+        name_candidates = defaultdict(list)
 
         for league_id, scorers in all_scorers.items():
             info = league_info.get(league_id, {})
@@ -288,16 +332,17 @@ async def build_index():
 
                 if pid_str not in players:
                     players[pid_str] = {
-                        "fn": fn,
-                        "ln": ln,
+                        "fn": "",
+                        "ln": "",
                         "entries": []
                     }
-                else:
-                    # Update name if current one is better (non-empty)
-                    if fn and not players[pid_str]["fn"]:
-                        players[pid_str]["fn"] = fn
-                    if ln and not players[pid_str]["ln"]:
-                        players[pid_str]["ln"] = ln
+
+                # Nur Zeilen mit mindestens einem nicht-leeren Namensfeld
+                # kommen als Kandidat infrage (leere Namen bleiben wie bisher
+                # ausgeschlossen). fn/ln bleiben als Paar zusammen.
+                if fn or ln:
+                    season_int = int(season) if season.isdigit() else -1
+                    name_candidates[pid_str].append((season_int, league_id, fn, ln))
 
                 players[pid_str]["entries"].append({
                     "s": season,
@@ -311,6 +356,13 @@ async def build_index():
                     "gp": games,
                     "pm": pm,
                 })
+
+        # Step 3b: Anzeigenamen aufloesen - Name aus der neuesten Saison
+        # gewinnt (Details siehe resolve_display_name). Spieler ohne
+        # Namenskandidaten behalten das ("", "") aus der Initialisierung.
+        # Ausgabeformat bleibt unveraendert: fn/ln getrennt.
+        for pid_str, cands in name_candidates.items():
+            players[pid_str]["fn"], players[pid_str]["ln"] = resolve_display_name(cands)
 
         # Step 4: Sort entries per player (newest season first, then by points desc)
         for pid_str in players:
