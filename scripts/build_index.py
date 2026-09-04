@@ -220,6 +220,41 @@ async def fetch_scorer_list(session: aiohttp.ClientSession, league_id: int, sema
     return await fetch_json(session, url, semaphore)
 
 
+async def fetch_player_master_name(session: aiohttp.ClientSession, pid: str, semaphore: asyncio.Semaphore):
+    """Liest (first_name, last_name) aus players/{pid}/stats - dem Stammdaten-
+    satz des Spielers.
+
+    Hintergrund: Die Scorerlisten (leagues/:id/scorer) frieren den Namen zum
+    Erfassungszeitpunkt ein und holen ihn nie wieder aus den Stammdaten. Fuer
+    IDs mit mehreren Namensvarianten ueber die Saisons ist der Stammdatensatz
+    deshalb die verlaesslichere Quelle als der Saison-Resolver - siehe
+    resolve_display_name und den Aufrufer in build_index (Step 3b).
+
+    Rueckgabe: (ok, (fn, ln)). ok=False bei dauerhaftem Fehlschlag (429 mit
+    Retry-After wird in fetch_json bereits abgewartet und begrenzt
+    wiederholt; 404/5xx/Timeout ebenso) ODER wenn keines der beiden
+    Namensfelder verwertbar zurueckkommt. Der Aufrufer faellt dann auf
+    resolve_display_name zurueck und zaehlt den Fall - der Build laeuft
+    weiter.
+
+    DSGVO: Die Rohantwort wird weder geloggt noch zurueckgegeben. Es werden
+    ausschliesslich die zwei Namensfelder ausgelesen, alles andere aus
+    players/:id/stats wird verworfen.
+    """
+    url = f"{API_BASE}/players/{pid}/stats"
+    ok, data = await fetch_json(session, url, semaphore)
+    if not ok or not isinstance(data, dict):
+        return False, ("", "")
+    player = data.get("player")
+    if not isinstance(player, dict):
+        return False, ("", "")
+    fn = (player.get("first_name") or "").strip()
+    ln = (player.get("last_name") or "").strip()
+    if not fn and not ln:
+        return False, ("", "")
+    return True, (fn, ln)
+
+
 async def build_index():
     """Main index building logic."""
     start_time = time.time()
@@ -357,12 +392,88 @@ async def build_index():
                     "pm": pm,
                 })
 
-        # Step 3b: Anzeigenamen aufloesen - Name aus der neuesten Saison
-        # gewinnt (Details siehe resolve_display_name). Spieler ohne
-        # Namenskandidaten behalten das ("", "") aus der Initialisierung.
-        # Ausgabeformat bleibt unveraendert: fn/ln getrennt.
+        # Step 3b: Anzeigenamen aufloesen.
+        #
+        # Basis fuer JEDE ID: resolve_display_name (Name aus der neuesten
+        # Saison gewinnt, Details dort). Damit hat jeder Spieler mit
+        # mindestens einem Namenskandidaten garantiert einen nicht-leeren
+        # Namen - auch als Fallback, falls der Stammdaten-Request unten
+        # scheitert. Spieler ganz ohne Kandidaten behalten das ("", "") aus
+        # der Initialisierung. Ausgabeformat bleibt unveraendert: fn/ln
+        # getrennt.
         for pid_str, cands in name_candidates.items():
             players[pid_str]["fn"], players[pid_str]["ln"] = resolve_display_name(cands)
+
+        # Fuer IDs mit MEHR ALS EINER distinkten (fn, ln)-Variante aus den
+        # Scorerlisten ist der Saison-Resolver nicht zuverlaessig: die
+        # Scorerlisten frieren den Namen zum Erfassungszeitpunkt ein und
+        # holen ihn nie wieder aus den Stammdaten (Liga 873 fuehrt z.B.
+        # dauerhaft einen alten Nachnamen, obwohl der Stammdatensatz
+        # derselben player_id laengst korrigiert ist). "Neueste Saison
+        # gewinnt" korrigiert das nur, wenn der Spieler nach der
+        # Namensaenderung ueberhaupt noch in einer Scorerliste auftaucht -
+        # wer aufhoert oder eine Saison punktlos bleibt, behaelt sonst
+        # dauerhaft den alten Namen. Fuer genau diese mehrdeutigen IDs
+        # fragen wir einmalig players/{pid}/stats als Namensautoritaet ab.
+        # Alle eindeutigen IDs (der Regelfall) loesen KEINEN Zusatz-Request
+        # aus.
+        ambiguous_pids = sorted(
+            pid_str for pid_str, cands in name_candidates.items()
+            if len({(fn, ln) for _, _, fn, ln in cands}) > 1
+        )
+        n_ambiguous = len(ambiguous_pids)
+
+        master_resolved = 0   # IDs, fuer die der Stammdatensatz einen Namen lieferte
+        master_differs = 0    # davon: Stammdaten-Name != Saison-Resolver-Name
+        master_fallback = 0   # mehrdeutige IDs, die auf resolve_display_name zurueckfielen
+
+        if n_ambiguous:
+            est_min = n_ambiguous * REQUEST_DELAY / 60
+            print(
+                f"\nStammdaten-Aufloesung: {n_ambiguous} mehrdeutige IDs "
+                f"(>1 Namensvariante aus den Scorerlisten), je 1 Request an "
+                f"players/:id/stats bei {REQUEST_DELAY}s Delay "
+                f"=~ {est_min:.0f} min Zusatzlaufzeit."
+            )
+            master_start = time.time()
+            for i, pid_str in enumerate(ambiguous_pids, 1):
+                ok, (fn, ln) = await fetch_player_master_name(session, pid_str, semaphore)
+                if ok:
+                    fb_fn, fb_ln = players[pid_str]["fn"], players[pid_str]["ln"]
+                    # fn und ln getrennt: ein Stammdatenwert ueberschreibt den
+                    # Fallback aus resolve_display_name nur, wenn er nicht
+                    # leer ist (fetch_player_master_name hat bereits .strip()
+                    # angewandt). Liefert der Stammdatensatz nur EIN
+                    # gefuelltes Feld, bleibt das andere auf dem korrekten
+                    # Fallback-Wert stehen - ein leeres Feld darf ihn nicht
+                    # plaetten.
+                    new_fn = fn or fb_fn
+                    new_ln = ln or fb_ln
+                    # master_differs zaehlt pro pid, nicht pro Feld.
+                    if (new_fn, new_ln) != (fb_fn, fb_ln):
+                        master_differs += 1
+                    players[pid_str]["fn"] = new_fn
+                    players[pid_str]["ln"] = new_ln
+                    master_resolved += 1
+                else:
+                    # Fallback (resolve_display_name) steht bereits - nur
+                    # zaehlen, Build NICHT abbrechen. Ein einzelner kaputter
+                    # Request darf den naechtlichen Job nicht kippen.
+                    master_fallback += 1
+                if i % 100 == 0 or i == n_ambiguous:
+                    print(
+                        f"  {i}/{n_ambiguous} - {master_resolved} per Stammdatensatz, "
+                        f"{master_fallback} Fallback"
+                    )
+                await asyncio.sleep(REQUEST_DELAY)
+            master_elapsed = time.time() - master_start
+            # Nur Aggregatzahlen - keine Namen, keine Liste betroffener IDs (DSGVO).
+            print(
+                f"\n  Fertig in {master_elapsed/60:.1f} min: "
+                f"{master_resolved} per Stammdatensatz aufgeloest, davon "
+                f"{master_differs} abweichend vom Saison-Resolver, "
+                f"{master_fallback} Fallback wegen Fehlschlag."
+            )
 
         # Step 4: Sort entries per player (newest season first, then by points desc)
         for pid_str in players:
@@ -398,6 +509,10 @@ async def build_index():
 
         print(f"\nDone!")
         print(f"  Players: {len(players):,}")
+        print(f"  Mehrdeutige IDs (Stammdaten-Request): {n_ambiguous:,}")
+        print(f"    davon per Stammdatensatz aufgeloest: {master_resolved:,} "
+              f"({master_differs:,} abweichend vom Saison-Resolver, "
+              f"{master_fallback:,} Fallback wegen Fehlschlag)")
         print(f"  Leagues processed: {len(all_scorers):,}")
         print(f"  Seasons: {season_years}")
         print(f"  Output: {OUTPUT_PATH}")
